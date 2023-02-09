@@ -1,0 +1,1630 @@
+---
+title: "Birthweight and DNA methylation age acceleration"
+author: "Edward Bruce Quinn"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    theme: readable
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    code_folding: show
+  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+
+```{r libraries}
+
+
+library(meffil)
+#options(mc.cores=1)
+
+
+library(tidyverse)
+library(readxl)
+library(rebus)
+library(ewastools)
+library(kableExtra)
+library(gtools)
+library(rlist)
+library(broom)
+library(lmtest)
+library(sandwich)
+library(scattermore)
+library(janitor)
+library(PCAtools)
+library(corrplot)
+library(GGally)
+library(prediction)
+library(ggVennDiagram)
+library(ggpubr)
+library(performance)
+library(sesame)
+library(parallel)
+library(doParallel)
+library(ComplexHeatmap)
+library(circlize)
+library(betareg)
+library(table1)
+library(DT)
+library(DNAmArray)
+library(DiagrammeR)
+library(lmerTest)
+library(jtools)
+library(interactions)
+library(performance)
+library(rmcorr)
+library(outliers)
+library(rebus)
+library(data.table)
+
+
+
+mutate <- dplyr::mutate 
+select <- dplyr::select
+rename <- dplyr::rename
+or <- rebus::or
+
+
+library(here)
+
+here <- here::here
+
+
+```
+
+
+
+
+# Meffil QC
+
+## read in data
+
+
+```{r subset the samples we have}
+
+
+
+df5 <- read.csv(file = here("data","sv_dnam_age_pub_df5_20221209.csv"))
+
+# Dropped a total of 332 samples there.496-332 = 164 idat files
+
+cat("We have",nrow(df5),"idat files remaining and",
+    length(unique(paste0(df5$dyad,df5$num))),
+    "unique individuals remaining.")
+
+# Read in age at sample collection
+
+ages <- read_csv(here("data","age_at_sample_collection_20220908.csv"))
+
+bdf <- df5 %>% 
+  left_join(ages, by = c("methylation_id" = "sample"))
+
+
+
+
+```
+
+
+## perform QC
+
+```{r meffil qc for babies and mothers}
+
+
+
+if(file.exists(here("output","qc.objects.baby.Robj"))) {
+  
+  load(here("output","qc.objects.baby.Robj"))
+  
+} else {
+
+qc.objects.baby <- meffil.qc(bdf, verbose=TRUE)
+save(qc.objects.baby,file = here("output","qc.objects.baby.Robj"))
+
+}
+
+
+
+ qc.parameters <- meffil.qc.parameters(
+	beadnum.samples.threshold             = 0.1,
+	detectionp.samples.threshold          = 0.1,
+	detectionp.cpgs.threshold             = 0.1,
+	beadnum.cpgs.threshold                = 0.1,
+	sex.outlier.sd                        = 5
+)
+
+ 
+# Get quality control summary reports
+ 
+if(file.exists(here("output","qcsummary.baby.Robj"))) {
+  
+  load(here("output","qcsummary.baby.Robj"))
+  
+} else {
+ 
+ qc.summary.baby <- meffil.qc.summary(
+ 	qc.objects.baby,
+ 	parameters = qc.parameters
+ )
+
+ save(qc.summary.baby, file = here("output","qcsummary.baby.Robj"))
+
+ meffil.qc.report(qc.summary.baby, 
+                  output.file = here("output","qc.report.baby.html"))
+
+}
+
+
+# List the quality control outliers
+
+
+outlier.baby <- qc.summary.baby$bad.samples
+table(outlier.baby$issue)
+index.baby <- outlier.baby$issue %in% c("Control probe (dye.bias)", 
+                              "Methylated vs Unmethylated",
+                              "X-Y ratio outlier",
+                              "Low bead numbers",
+                              "Detection p-value",
+                              "Sex mismatch",
+                              "Control probe (bisulfite1)",
+                              "Control probe (bisulfite2)")
+
+outlier.baby <- outlier.baby[index.baby,]
+
+
+
+
+
+```
+
+
+# Contamination check
+
+Use ewastools package for this.
+
+```{r perform ewastools contamination check}
+
+
+if(file.exists(here("output","snps.RDS"))){
+  
+  snps <- readRDS(file = here("output","snps.RDS"))
+  
+} else {
+
+meth <- read_idats(bdf$Basename,quiet = FALSE) 
+
+detectionP <- ewastools::detectionP
+mask <- ewastools::mask
+correct_dye_bias <- ewastools::correct_dye_bias
+dont_normalize <- ewastools::dont_normalize
+
+# get betas
+beta <- meth %>% detectionP %>% mask(0.01) %>% correct_dye_bias %>% dont_normalize
+
+# get snps
+snps <- meth$manifest[probe_type=="rs",index]
+snps <- beta[snps,]
+
+saveRDS(snps, file = here("output","snps.RDS"))
+
+rm(meth)
+rm(beta)
+
+}
+
+
+genotypes <- call_genotypes(snps,learn=FALSE)
+
+bdf$outlier <- snp_outliers(genotypes)
+
+contam <- bdf[bdf$outlier > -4,c("Sample_Name","outlier")]
+
+contam %>% kbl(caption="Samples identified as contaminated by ewastools") %>% kable_styling("hover",full_width=F)
+
+```
+
+
+# SeSame noob
+
+Get noob corrected betas for the epigenetic clock.
+
+```{r get noob corrected betas using sesame}
+
+
+if(file.exists(here("data", "sv_babies_noob_betas.rds"))) {
+
+noobBetas <- readRDS(file = here("data", "sv_babies_noob_betas.rds"))
+
+} else {
+ 
+
+ noobBetas <- do.call(cbind, lapply(bdf$Basename, function(pfx) {
+    getBetas(noob(readIDATpair(pfx)), mask = F)
+ }))
+
+
+
+ colnames(noobBetas) <- bdf$methylation_id
+
+ saveRDS(noobBetas, file = here("data","sv_babies_noob_betas.rds"))
+
+}
+
+```
+
+> Initial quality control indicates that SV001b.b.1.2 fails multiple
+QC checks and SV014b.b.1.1 fails the sex check. Let's remove these two
+prior to uploading data to the epigenetic clock.
+
+## prepare data for epigenetic clock
+
+```{r get epigenetic clock data, results='hide'}
+
+failed_qc <- c("SV001b.b.1.2","SV014b.b.1.1")
+
+
+clock <- bdf %>% 
+  filter(methylation_id != "SV001b.b.1.2") %>% 
+  filter(methylation_id != "SV014b.b.1.1") # Lose 2 samples. N = 162.
+
+
+# Reformat the noob betas object obtained in the chunk above this one
+# and filter them for the probes needed for the epigenetic clock.
+
+noobBetas <- as.data.frame(noobBetas)
+noobBetas$Name <- rownames(noobBetas)
+probes <- read.csv(here("data","datMiniAnnotation3.csv"))
+
+
+# get betas for Horvath's probe list
+fil.noob.betas <- merge(probes, noobBetas, by = "Name", all.x = TRUE, all.y = FALSE)
+nrow(fil.noob.betas) # 30084 is what we need
+
+fil.noob.betas[1:10,1:10]
+
+
+# remove extra columns
+fil.noob.betas <- fil.noob.betas[-c(2:7)]
+
+colnames(fil.noob.betas)[1] <- "ProbeID"
+
+# Now remove the two samples failing QC: SV001b.b.1.2 AND SV014b.b.1.1 
+
+fil.noob.betas <- fil.noob.betas %>% 
+  select(-failed_qc)
+
+cn <- colnames(fil.noob.betas[-1])
+
+link <- match(cn,clock$methylation_id)
+
+cc2 <- clock[link,]
+
+identical(colnames(fil.noob.betas[-1]),cc2$methylation_id)
+
+write.csv(cc2, 
+          file = here("data","epigenetic_clock_samplesheet.csv"), 
+          row.names = F)
+write.csv(fil.noob.betas, 
+          row.names = F, 
+          file = here("data","epigenetic_clock_betas.csv"))
+
+```
+
+
+<br> <br>
+
+Upload the data to the epigenetic clock website using the "New
+Methylation Age Calculator Website". Get the file emailed to you from
+[Steve Horvath's epigenetic age calculator
+website](https://dnamage.genetics.ucla.edu/home) afterwards.
+
+<br> <br>
+
+## format epigenetic age data
+
+```{r wrangle epigenetic age data, message=FALSE, warning=FALSE, results='hide'}
+
+# Read in output from Horvath's website
+mage <- read.csv(here("data","epigenetic_clock_betas.output.csv"))
+
+# Create a data frame of problematic samples by the epigenetic clock
+# quality control checks
+
+gs <- mage %>% 
+  filter(corSampleVSgoldstandard < 0.80) %>% 
+  select(methylation_id)
+
+clock_sex_checks <- mage %>% 
+  mutate(problem_sex = case_when(
+    predictedGender == "female" & Female == 1 ~ FALSE,
+    predictedGender == "male" & Female == 0 ~ FALSE,
+    predictedGender == "female" & Female == 0 ~ TRUE,
+    predictedGender == "male" & Female == 1 ~ TRUE,
+    predictedGender == "Unsure" ~ TRUE)) %>% 
+  filter(problem_sex == TRUE)
+
+# Which samples fail these two quality control checks that
+# are part of the epigenetic clock? None.
+
+
+
+
+# Get replicate status and subset for all replicates.
+# Use this to get list of which samples to average.
+
+# Since we have filtered samples at this point, the original
+# vector labeling replicates is no longer accurate. Make a 
+# new one.
+
+reps <- bdf %>% 
+  group_by(dyad,timepoint) %>% 
+  filter(n()>1) %>% 
+  ungroup() %>% 
+  select(methylation_id)
+
+bdf$replicate <- ifelse(bdf$methylation_id %in% reps$methylation_id, TRUE, FALSE)
+
+rav <- bdf %>% 
+  select(methylation_id,replicate,dyad,timepoint) %>% 
+  filter(replicate == TRUE) %>% 
+  group_by(dyad,timepoint) %>% 
+  select(methylation_id) 
+
+toAverage <- by(rav$methylation_id,rav$dyad,print)
+
+# average by replicates using the avgReps function and store the new
+# rows in a data frame
+
+# write function to average replicates
+
+avgReps <- function(repsToAverage){
+  
+  dr <- mage[mage$methylation_id %in% repsToAverage,]
+  
+  row <- dr %>% 
+    summarise_if(is.numeric, mean, na.rm = TRUE)
+  
+  x <- smartbind(dr,row,fill="replaceme")
+  
+  dex <- grep("replaceme",x[nrow(x), ])
+  
+  fillers <- x[nrow(x) - 1, dex]
+  
+  fin <- replace(x[nrow(x), ], dex, fillers)
+  
+  return(fin[nrow(fin),])
+}
+
+# Average the replicates using the avgReps function
+
+rep1 <- avgReps(toAverage$SV15)
+rep2 <- avgReps(toAverage$SV18)
+rep3 <- avgReps(toAverage$SV61)
+rep4 <- avgReps(toAverage$SV67)
+
+
+averaged_reps <- bind_rows(rep1,rep2,rep3,rep4)
+
+
+
+# remove replicates rows from original epigenetic age
+# data frame and then
+# Add back in the rows with the average replicate
+# values. For character vectors, such as slide
+# and position on slide, just selecting a single
+# value because these cannot be averaged. That's
+# fine as long as we're only using numeric variables.
+
+mage2 <- mage %>% 
+  filter(!(methylation_id %in% rav$methylation_id)) %>% 
+  bind_rows(averaged_reps) # This step takes us from n=162 to n=156
+
+cat("There were",length(rav$methylation_id),"replicate samples total out of",
+    nrow(mage),"samples in epigenetic age analyses, corresponding to",
+    nrow(averaged_reps),"unique individuals for whom we had replicates samples.")
+cat("These were removed from the data, averaged by replicate, and
+    then added back into the data, leaving",
+    nrow(mage2),"samples.")
+
+
+```
+
+
+## covariates
+
+```{r format outcome and some covariates}
+# calculate maternal bmi, dichotomize birthweight and parity
+
+mage2 <- mage2 %>% 
+  mutate(bmi = mwgt/((mhgt/100)^2))
+
+mage2$kbwgt <- mage2$bwgt/1000
+mage2$bhilo <- factor(ifelse(mage2$bwgt > 2500,"Normal","Low"),
+                    levels = c("Low","Normal"))
+mage2$Parity <- factor(ifelse(mage2$parity_bf_birth > 0,"Multigravida","Primigravida"),
+                 levels = c("Primigravida","Multigravida"))
+
+
+
+```
+
+
+<br> <br> 
+
+> Label covariates
+
+```{r get table one and two}
+
+mage2$Sex <- factor(ifelse(mage2$Female==1,"Female","Male"), levels = c("Female","Male"))
+
+mage2$Delivery_Method <- factor(ifelse(mage2$pcsec==1,"Cesarean","Vaginal"), 
+                              levels = c("Cesarean","Vaginal"))
+
+
+mage2$Alcohol_in_Pregnancy <- factor(ifelse(mage2$palco==1,"Alcohol","No Alcohol"),
+                                   levels = c("Alcohol","No Alcohol"))
+
+
+mage2$Age_Acceleration <- mage2$AgeAccelerationResidual
+mage2$Low_Birthweight <- mage2$bhilo
+mage2$Time_Point <- factor(mage2$timepoint, levels = c("birth","6 months","1 year","2 years","3 years"),
+                           labels = c("Birth","6 months","1 year","2 years","3 years"))
+
+mage2$Maternal_BMI <- mage2$bmi
+mage2$Maternal_Age <- mage2$mom_age
+
+mage2$War_Stress <- mage2$swar
+mage2$Chronic_Stress <- mage2$schronic
+
+mage2$Birthweight <- mage2$bwgt
+
+mage2$Gestational_Age <- mage2$ga_meth/7
+
+
+
+```
+
+# Analysis
+
+
+
+What was the total number of observations? 
+
+```{r total number of observations}
+
+nrow(mage2)
+
+```
+What was the number of unique individuals?
+
+```{r number of unique individuals}
+
+length(unique(mage2$dyad))
+
+```
+
+
+What was the average number of observations per individual? 
+
+```{r average number of observations per individual}
+
+nrow(mage2)/length(unique(mage2$dyad))
+
+```
+
+How many of the babies are high birth weight? How many babies were preterm?
+
+```{r how many of the babies are high birthweight}
+
+mage2 %>% 
+  mutate(hbw = if_else(Birthweight > 4000, TRUE, FALSE)) %>% 
+  select(methylation_id,hbw,bwgt) %>% 
+  filter(hbw == TRUE)
+
+mage2 %>% 
+  filter(Time_Point == "Birth") %>% 
+  mutate(preterm = if_else(Gestational_Age < 37, TRUE, FALSE)) %>% 
+  select(preterm) %>% 
+  table()
+
+
+```
+
+
+# EDA
+
+> Look at the DNA methylation age data
+
+```{r look at DNAm data}
+
+ggplot(data = mage2, aes(x = Age, y = DNAmAge)) + 
+  geom_point(shape = 21) +
+  theme_pubr(base_size = 14) +
+  scale_x_continuous(breaks = c(0:7), labels = c(0:7)) +
+  scale_y_continuous(breaks = c(0:7), labels = c(0:7)) +
+  xlab("Chronological Age") +
+  ylab("DNA Methylation Age") + 
+  geom_smooth(method="lm",se=FALSE) +
+  # annotate("text",x = 0.25, y = 6,
+  #          label = label1, 
+  #          hjust = 0, fontface = 2) +
+  geom_abline(intercept = 0, slope = 1, lty = "dashed")
+
+```
+
+
+There is one point that stands out at the at birth time point. Which person is this?
+
+```{r who is the potential outlier}
+
+
+
+ggplot(data = mage2, aes(x = Age, y = DNAmAge)) + 
+  geom_point(shape = 21) +
+  theme_pubr(base_size = 14) +
+  scale_x_continuous(breaks = c(0:7), labels = c(0:7)) +
+  scale_y_continuous(breaks = c(0:7), labels = c(0:7)) +
+  xlab("Chronological Age") +
+  ylab("DNA Methylation Age") + 
+  geom_smooth(method="lm",se=FALSE) +
+  # annotate("text",x = 0.25, y = 6,
+  #          label = label1, 
+  #          hjust = 0, fontface = 2) +
+  geom_abline(intercept = 0, slope = 1, lty = "dashed") +
+  geom_text(aes(label=ifelse(DNAmAge > 1 & 
+                               timepoint =="birth",
+                             as.character(methylation_id),'')),hjust=0,vjust=0)
+
+
+```
+
+Do a formal test to see if this value is indeed an outlier. 
+
+```{r do an outlier test}
+
+
+outlier_birth <- grubbs.test(mage2[mage2$timepoint=="birth","DNAmAge"])
+
+outlier_birth
+
+
+```
+
+SV005.2.1a is an outlier by the grubbs test. Remove from all further analyses
+
+```{r remove the outlier}
+
+dim(mage2)
+
+mage2 <- mage2 %>% 
+  filter(methylation_id != "SV005bb.2.1a")
+
+dim(mage2) # 155 observations left
+
+length(unique(mage2$dyad)) # 67 unique dyads left.
+  
+
+```
+
+## Table 1
+
+```{r make table 1}
+
+table1(~ DNAmAge + Birthweight + Low_Birthweight + Sex + Gestational_Age + Maternal_Age + Parity + Delivery_Method + Alcohol_in_Pregnancy + Maternal_BMI + War_Stress + Chronic_Stress | Time_Point, data = mage2, 
+       overall = FALSE, topclass="Rtable1-zebra")
+
+
+```
+
+<br> <br> <br>
+
+## Correlation & Error Analyses
+
+What is the correlation among unique individuals, with random selection
+of the time point of observation? What is the correlation among unique
+individuals, with specific selection for the latest date of sample
+collection for each unique individual?
+
+```{r correlation analysis}
+
+set.seed(456)
+random_unique <- mage2 %>% 
+  group_by(dyad) %>% 
+  slice_sample(n = 1)
+
+cor.test(random_unique$Age,random_unique$DNAmAge) # r = 0.93, p < 2.2e-16
+sd(random_unique$Age) # standard deviation = 0.884.
+
+
+# Now select the latest observation from within each individual only:
+last_obs <- mage2 %>% 
+  group_by(dyad) %>% 
+  slice_max(Age,n = 1)
+
+cor.test(last_obs$Age,last_obs$DNAmAge) # r = 0.93, p < 2.2e-16
+sd(last_obs$Age) # standard deviation = 1.274349
+
+# Calculate median absolute error across all data
+
+mage2$dev_all <- abs(mage2$DNAmAge - mage2$Age)
+median(mage2$dev_all) # Median Absolute Error = 0.6010764 years
+
+
+# Calculate correlation across all data, ignoring lack of independence
+
+cor.test(mage2$DNAmAge,mage2$Age) # r = 0.93, p < 2.2e-16
+
+
+
+```
+
+<br> <br> <br>
+
+## Table S1
+
+```{r mae by timepoint}
+
+# Supplemental Table 1
+
+# Calculate median absolute error at each timepoint:
+err_all <- mage2 %>% 
+  group_by(Time_Point) %>% 
+  summarise(median(abs(DNAmAge - Age)))
+
+kbl(err_all, caption = "Supplemental Table 1 - Median Absolute Error by Time Point",
+    col.names = c("Time Point", "Median Absolute Error"),
+    digits = 2) %>% 
+  kable_styling(full_width = F)
+
+
+```
+
+
+<br> <br> <br>
+
+## Variance Analysis
+
+```{r test for increasing variance over time}
+
+library(PairedData)
+
+# We actually need a wide data-set for this test.
+
+wide <- mage2 %>% 
+  dplyr::select(dyad,Time_Point,DNAmAge) %>% 
+  tidyr::pivot_wider(names_from = Time_Point, values_from = DNAmAge)
+
+# Meet assumptions of normality?
+shapiro.test(wide$Birth)
+shapiro.test(wide$`1 year`)
+shapiro.test(wide$`2 years`)
+shapiro.test(wide$`3 years`)
+
+# yes, in all cases
+
+
+wide %>% 
+  select(Birth,`1 year`) %>% 
+  tidyr::drop_na() %>% 
+  summarise(variance_birth = var(Birth),variance_1 = var(`1 year`),n = n()) # sample size = 32
+
+grambsch.Var.test(wide$Birth,wide$`1 year`) # z = -4.0388, p-value = 5.373e-05
+
+
+wide %>% 
+  select(Birth,`2 years`) %>% 
+  tidyr::drop_na() %>% 
+  summarise(variance_birth = var(Birth),variance_2 = var(`2 years`),n = n()) # sample size = 29
+
+
+grambsch.Var.test(wide$Birth,wide$`2 years`) # z = -3.1516, p-value = 0.001624
+
+wide %>% 
+  select(Birth,`3 years`) %>% 
+  tidyr::drop_na() %>% 
+  summarise(variance_birth = var(Birth),variance_3 = var(`3 years`),n = n()) # sample size = 16
+
+grambsch.Var.test(wide$Birth,wide$`3 years`) # z = -4.3993, p-value = 1.086e-05
+
+wide %>% 
+  select(`1 year`,`2 years`) %>% 
+  tidyr::drop_na() %>% 
+  summarise(variance_1 = var(`1 year`),variance_2 = var(`2 years`),n = n())  # sample size = 31
+
+grambsch.Var.test(wide$`1 year`,wide$`2 years`) # z = -1.1598, p-value = 0.2461 not significant
+
+wide %>% 
+  select(`1 year`,`3 years`) %>% 
+  tidyr::drop_na() %>% 
+  summarise(variance_1 = var(`1 year`),variance_3 = var(`3 years`),n = n()) # sample size = 16
+
+grambsch.Var.test(wide$`1 year`,wide$`3 years`) # z = -4.0983, p-value = 4.162e-05
+
+wide %>% 
+  select(`2 years`,`3 years`) %>% 
+  tidyr::drop_na() %>% 
+  summarise(variance_2 = var(`2 years`),variance_3 = var(`3 years`),n = n()) # sample size = 16
+
+grambsch.Var.test(wide$`2 years`,wide$`3 years`) # z = -3.4439, p-value = 0.0005733
+
+# sample size for the test above?
+
+# All of these variance comparisons are significant
+# except for the comparison between 1 year and 2 years.
+# The six month timepoint is left out because the sample
+# size is too small to estimate a variance.
+  
+
+# Detach the PairedData package because it has it's own summary function
+# that I don't want to deal with.
+
+detach("package:PairedData", unload=TRUE)
+
+
+```
+
+<br> <br> <br>
+
+## Repeated Measures Correlation Analysis
+
+```{r rm corr analysis}
+
+
+
+b_1 <- rmcorr(participant = dyad, measure1 = Age,
+              measure2 = DNAmAge, dataset =  mage2)
+
+b_1 # r = 0.95, p = 1.57431e-44
+
+
+```
+
+
+<br> <br> <br>
+
+## At birth analysis
+
+```{r at birth tests}
+
+# differences in ageaccel by birthweight category or sex at birth?
+
+bdat <- mage2[mage2$Time_Point=="Birth",]
+
+shapiro.test(bdat$AgeAccelerationResidual) # normally distributed
+
+t.test(bdat$AgeAccelerationResidual ~ bdat$Low_Birthweight) # pval = 0.6791
+
+t.test(bdat$AgeAccelerationResidual ~ bdat$Sex) # pval = 0.2099
+
+# Is the overall DNA methylation age different from zero at birth?
+
+t.test(bdat$DNAmAge)
+
+# Yes it is. Average = 0.2857662, pval = 8.064e-16.
+
+```
+
+<br> <br> <br>
+
+## Figure 1
+
+```{r plot DNAm age and DNAm age acceleration}
+
+# Make a column to indicate whether a measurement of DNAm is
+# age accelerated or not, and use that to color points on 
+# the scatter plot.
+
+mage2$accel <- factor(ifelse(mage2$AgeAccelerationResidual > 0, "Age Acceleration","Age Deceleration"))
+
+
+# repeated measures correlation calculated above.
+
+label1 <- expression(bold("r"[rm]* "= 0.95, p < 2.2e-16"))
+
+
+# Dna Methylation age of sv follow-up babies plus line
+p <- ggplot(data = mage2, aes(x = Age, y = DNAmAge)) + 
+  geom_point(shape = 21, aes(fill = accel)) +
+  scale_fill_manual(values = c("Age Acceleration" = "red", 
+                                 "Age Deceleration" = "blue")) +
+  theme_pubr(base_size = 14) +
+  scale_x_continuous(breaks = c(0:7), labels = c(0:7)) +
+  scale_y_continuous(breaks = c(0:7), labels = c(0:7)) +
+  xlab("Chronological Age") +
+  ylab("DNA Methylation Age") + 
+  geom_smooth(method="lm",se=FALSE, color = "black") +
+  annotate("text",x = 0.25, y = 6,
+           label = label1, 
+           hjust = 0, fontface = 2)  +
+  theme(legend.title = element_blank())
+
+
+
+q <- ggplot(data = mage2, aes(x = Age, y = AgeAccelerationResidual)) + 
+  geom_point(shape = 21, aes(fill = accel)) +
+  scale_fill_manual(values = c("Age Acceleration" = "red", 
+                                 "Age Deceleration" = "blue")) +
+  theme_pubr(base_size = 14) +
+  scale_x_continuous(breaks = c(0:7), labels = c(0:7)) +
+  scale_y_continuous(breaks = c(-4:4), labels = c(-4:4)) +
+  xlab("Chronological Age") +
+  ylab("Epigenetic Age Acceleration") +
+  geom_hline(yintercept = 0, color = "black", size = 1) +
+  theme(legend.title = element_blank())
+
+
+fig1 <- ggarrange(p,q,labels = c("A", "B"),ncol = 2, nrow = 1, 
+                  common.legend = TRUE, legend = "bottom")
+ggarrange(p,q,labels = c("A", "B"),ncol = 2, nrow = 1, 
+          common.legend = TRUE, legend = "bottom")
+ggsave(here("output","figure_1.TIFF"), plot = fig1, dpi = 1000,
+       height = 4.5)
+
+
+# Make plots for dissertation defense
+
+dnam_defense_plot <- p
+
+epi_age_accel_defense_plot <- q + ylab("Epigenetic Age Deceleration or Acceleration")
+
+
+```
+
+<br> <br> <br>
+
+
+<br> <br> <br>
+
+## Birthweight Regressions
+
+### ICC
+
+```{r get ICC}
+
+
+df6 <- mage2
+
+# Get ICC
+m1a <- lmer(AgeAccelerationResidual ~ 1 +
+              (1|dyad), 
+            data = df6[complete.cases(df6$AgeAccelerationResidual),], REML = FALSE, 
+            control = lmerControl(optimizer="Nelder_Mead",optCtrl=list(maxfun=20000)))
+summary(m1a) 
+
+icc <- 0.31617/(0.31617 + 0.08626)
+icc # 0.7856522
+
+# 78.6% of the variation in AgeAccel is between dyads, and 21.4% of
+# the variation is within dyads.
+
+```
+
+
+### Table 2
+
+```{r adjusted cell type corrected models}
+
+
+adj_cell <- lmer(AgeAccelerationResidual ~ 1 + 
+              Age*Low_Birthweight + 
+                Sex + 
+                Gestational_Age +
+                Maternal_Age + 
+                Maternal_BMI + 
+                Parity + 
+                Delivery_Method + 
+                Alcohol_in_Pregnancy + 
+                CD8.naive + 
+                CD8pCD28nCD45RAn +
+                PlasmaBlast + 
+                CD4T + 
+                NK + 
+                Mono + 
+                Gran + 
+                War_Stress + 
+                Chronic_Stress +
+              (0 + Age|dyad), 
+            data = df6, REML = FALSE, 
+            control = lmerControl(optimizer="Nelder_Mead",optCtrl=list(maxfun=20000)))
+
+# Get parameters
+summary(adj_cell)
+model_performance(adj_cell)
+
+
+
+coef_names4b <- c("Age" = "Age", 
+                  "Low Birthweight (Normal)" = "Low_BirthweightNormal",
+                  "Sex (Male)" = "SexMale",
+                  "Gestational Age" = "Gestational_Age",
+                  "Maternal Age" = "Maternal_Age",
+                  "Maternal BMI" = "Maternal_BMI",
+                  "Parity (Multigravida)" = "ParityMultigravida",
+                  "Delivery Mode (Vaginal)" = "Delivery_MethodVaginal",
+                  "Alcohol (No Alcohol)" = "Alcohol_in_PregnancyNo Alcohol",
+                  "CD8 naive" = "CD8.naive",
+                  "CD8pCD28nCD45RAn" = "CD8pCD28nCD45RAn",
+                  "Plasma Blast" = "PlasmaBlast",
+                  "CD4T" = "CD4T",
+                  "Natural Killer" = "NK",
+                  "Monocytes" = "Mono",
+                  "Granulocytes" = "Gran",
+                  "War Trauma" = "War_Stress",
+                  "Chronic Stress" = "Chronic_Stress",
+                  "Age x Low Birthweight" = "Age:Low_BirthweightNormal")
+
+
+
+export_summs(adj_cell, model.names = c("Adjusted for Covariates \n and Immune Cell 
+                                             Proportions"), 
+                             coefs = coef_names4b,
+                             error_format = "[{conf.low}, {conf.high}]", 
+                             error_pos = c("same"),
+                             digits = 2,
+             to.file = "Word",
+             file.name = here("output","raw_table_2.docx")) 
+
+
+
+```
+
+> What is the predicted value for age acceleration of a low birthweight baby at three years?
+
+```{r pred value at three years birthweight dichotomized}
+
+pred_3_years <- make_predictions(adj_cell, pred = "Age",pred.values = c(3), at = list("Low_Birthweight" = "Low"))
+
+pred_3_years %>% select(AgeAccelerationResidual) # 0.7 years of age acceleration.
+
+```
+
+
+
+### Continuous birthweight
+
+<br>
+
+**This analysis is for Supplemental Table 2**
+
+<br>
+
+```{r continous birthweight regressions}
+
+
+adj_cell_cont <- lmer(AgeAccelerationResidual ~ 1 + 
+              Age*kbwgt + 
+                Sex + 
+                Gestational_Age +
+                Maternal_Age + 
+                Maternal_BMI + 
+                Parity + 
+                Delivery_Method + 
+                Alcohol_in_Pregnancy + 
+                CD8.naive + 
+                CD8pCD28nCD45RAn +
+                PlasmaBlast + 
+                CD4T + 
+                NK + 
+                Mono + 
+                Gran + 
+                War_Stress + 
+                Chronic_Stress +
+              (0 + Age|dyad), 
+              data = df6, REML = FALSE, 
+            control = lmerControl(optimizer="Nelder_Mead",optCtrl=list(maxfun=20000)))
+
+# Get parameters
+summary(adj_cell_cont, pvals = TRUE, digits = 3)
+model_performance(adj_cell_cont)
+
+
+
+coef_names4b_cont <- c("Age" = "Age", 
+                       "Birthweight (kilograms)" = "kbwgt",
+                        "Sex (Male)" = "SexMale",
+                "Gestational Age" = "Gestational_Age",
+                "Maternal Age" = "Maternal_Age",
+                "Maternal BMI" = "Maternal_BMI",
+                "Parity (Multigravida)" = "ParityMultigravida",
+                "Delivery Mode (Vaginal)" = "Delivery_MethodVaginal",
+                "Alcohol (No Alcohol)" = "Alcohol_in_PregnancyNo Alcohol",
+                "CD8.naive" = "CD8.naive",
+                "CD8pCD28nCD45RAn" = "CD8pCD28nCD45RAn",
+                "Plasma Blast" = "PlasmaBlast",
+                "CD4T" = "CD4T",
+                "Natural Killer" = "NK",
+                "Monocytes" = "Mono",
+                "Granulocytes" = "Gran",
+                "War Trauma" = "War_Stress",
+                "Chronic Stress" = "Chronic_Stress",
+                "Age x Birthweight" = "Age:kbwgt")
+
+
+
+
+
+```
+
+<br>
+<br>
+
+## Table S2
+
+```{r supplemental table 2}
+
+export_summs(adj_cell_cont, model.names = c("Adjusted \n for Covariates \n and Immune Cell 
+                                             Proportions"), 
+                             coefs = coef_names4b_cont,
+                             error_format = "[{conf.low}, {conf.high}]", 
+                             error_pos = c("same"),
+                             digits = 2,
+                             to.file = "Word",
+                            file.name = here("output","raw_supplemental_table_2.docx")) 
+
+
+```
+
+> What are the predicted values for someone at three years of age
+
+## Figure 2
+
+```{r plot birthweight interaction}
+
+################################
+# Partial Residual Plot
+################################
+
+
+
+fig2 <- interact_plot(adj_cell, Age, Low_Birthweight,
+                      partial.residuals = TRUE, 
+                      interval = FALSE,
+                      x.label = "Chronological Age", 
+                      y.label = "Adjusted Epigenetic Age Acceleration", 
+                      legend.main = "Birthweight",
+                      modx.labels = c("<2500 g","> 2500 g"))
+
+fig2 <- fig2 + 
+  theme(legend.position = "right") +
+  scale_y_continuous(breaks = seq(-1,1,0.5), labels = seq(-1,1,0.5) )
+fig2
+#ggsave(here("output","figure_2.TIFF"), plot = fig2, dpi = 1000)
+ggsave(here("output","figure_2_no_conf_int.TIFF"), plot = fig2, dpi = 1000)
+
+
+##############################
+# Simple slopes analylsis
+##############################
+
+sim_slopes(adj_cell, pred = Age, modx = Low_Birthweight, jnplot = TRUE)
+
+```
+> Supplemental Figure of interaction with birthweight as a continuous variable
+
+```{r supp figure 1}
+
+figs1 <- interact_plot(adj_cell_cont, Age, kbwgt,
+                      partial.residuals = TRUE, 
+                      interval = FALSE,
+                      x.label = "Chronological Age", 
+                      y.label = "Adjusted Epigenetic Age Acceleration", 
+                      legend.main = "Birthweight")
+
+figs1 <- figs1 + 
+  theme(legend.position = "right") +
+  scale_y_continuous(breaks = seq(-1,1,0.5), labels = seq(-1,1,0.5) )
+figs1
+ggsave(here("output","figure_s1.TIFF"), plot = figs1, dpi = 1000)
+
+
+##############################
+# Simple slopes analylsis
+##############################
+
+sim_slopes(adj_cell_cont, pred = Age, modx = kbwgt, jnplot = TRUE)
+
+```
+
+
+<br>
+<br>
+<br>
+
+## Missingness analyses
+
+Are the babies without follow-up data different from those babies with
+follow-up data?
+
+```{r missingness analysis}
+
+# Subset for the babies included in the regression analyses:
+
+df7 <- df6[complete.cases(df6$Sex,df6$Gestational_Age,
+                                      df6$Maternal_Age,df6$Maternal_BMI,
+                                      df6$Parity,df6$Delivery_Method,
+                                      df6$Alcohol_in_Pregnancy,
+                                      df6$Low_Birthweight),]
+
+# create a new variable in df7 for follow-up presence
+# Make two vectors, one with at birth ids and one with
+# ids at all other timepoints. Then use ifelse to test
+# whether an ID is in the followup group.
+
+df7$bfu <- ifelse(df7$Time_Point=="Birth","birth","fu")
+
+bid <- df7[df7$bfu=="birth","dyad"]
+
+fid <- df7[df7$bfu=="fu","dyad"]
+
+att <- ifelse(bid %in% fid,"follow-up","no follow up")
+
+att <- cbind.data.frame(bid,att)
+
+df8 <- df7[df7$Time_Point=="Birth",]
+
+df9 <- merge(df8,att,by.x = "dyad", by.y = "bid")
+
+# Test for differences in covariates by attrition status #
+
+# anovas
+
+summary(aov(df9$Gestational_Age ~ df9$att))
+summary(aov(df9$Birthweight ~ df9$att))
+summary(aov(df9$Maternal_Age ~ df9$att)) # significant
+
+# p value = 0.0516. Babies without follow-up were born
+# to younger mothers:
+
+tapply(df9$Maternal_Age, df9$att, mean)
+
+# follow-up no follow up 
+#     18.15625     16.33333
+
+ggplot(df9, aes(x = att, y = Maternal_Age)) +
+  theme_bw() +
+  geom_boxplot()
+
+summary(aov(df9$Maternal_BMI ~ df9$att))
+summary(aov(df9$Chronic_Stress ~ df9$att))
+summary(aov(df9$War_Stress ~ df9$att))
+
+# chi squared tests
+
+chisq.test(df9$parity, df9$att)
+chisq.test(df9$Delivery_Method, df9$att)
+chisq.test(df9$Low_Birthweight, df9$att)
+chisq.test(df9$Alcohol, df9$att)
+chisq.test(df9$sex,df9$att)
+
+
+```
+
+
+# Sensitivity
+
+> Does removing the high birthweight babies change the result?
+
+```{r high bw sensitivity analysis}
+
+df_no_high <- df6 %>% 
+  filter(bwgt < 4000)
+
+
+adj_cell_no_high <- lmer(AgeAccelerationResidual ~ 1 + 
+              Age*Low_Birthweight + 
+                Sex + 
+                Gestational_Age +
+                Maternal_Age + 
+                Maternal_BMI + 
+                Parity + 
+                Delivery_Method + 
+                Alcohol_in_Pregnancy + 
+                CD8.naive + 
+                CD8pCD28nCD45RAn +
+                PlasmaBlast + 
+                CD4T + 
+                NK + 
+                Mono + 
+                Gran + 
+                War_Stress + 
+                Chronic_Stress +
+              (0 + Age|dyad), 
+            data = df_no_high, REML = FALSE, 
+            control = lmerControl(optimizer="Nelder_Mead",optCtrl=list(maxfun=20000)))
+
+# Get parameters
+summary(adj_cell_no_high)
+model_performance(adj_cell_no_high)
+
+
+
+coef_names4b <- c("Age" = "Age", 
+                  "Low Birthweight (Normal)" = "Low_BirthweightNormal",
+                  "Sex (Male)" = "SexMale",
+                  "Gestational Age" = "Gestational_Age",
+                  "Maternal Age" = "Maternal_Age",
+                  "Maternal BMI" = "Maternal_BMI",
+                  "Parity (Multigravida)" = "ParityMultigravida",
+                  "Delivery Mode (Vaginal)" = "Delivery_MethodVaginal",
+                  "Alcohol (No Alcohol)" = "Alcohol_in_PregnancyNo Alcohol",
+                  "CD8 naive" = "CD8.naive",
+                  "CD8pCD28nCD45RAn" = "CD8pCD28nCD45RAn",
+                  "Plasma Blast" = "PlasmaBlast",
+                  "CD4T" = "CD4T",
+                  "Natural Killer" = "NK",
+                  "Monocytes" = "Mono",
+                  "Granulocytes" = "Gran",
+                  "War Trauma" = "War_Stress",
+                  "Chronic Stress" = "Chronic_Stress",
+                  "Age x Low Birthweight" = "Age:Low_BirthweightNormal")
+
+
+
+export_summs(adj_cell_no_high, model.names = c("Adjusted for Covariates\n and Immune Cell Proportions\n no high birth\n weight babies"), 
+                             coefs = coef_names4b,
+                             error_format = "[{conf.low}, {conf.high}]", 
+                             error_pos = c("same"),
+                             digits = 2,
+             to.file = "Word",
+             file.name = here("output","raw_supplemental_table_3.docx")) 
+
+```
+
+
+# Gene Expression Omnibus
+
+## GEO Deposition Part 1
+
+> For epigenetic age analyses, processed data are in the noobBetas object
+but can be regenerated here:
+
+
+```{r get data objects for geo deposition}
+
+# rearrange the object to comply with formatting for GEO deposition:
+
+noobBetasGEO <- noobBetas[,c(ncol(noobBetas),1:(ncol(noobBetas)-1))]
+colnames(noobBetasGEO)[1] <- "ID_REF"
+
+rm(noobBetas)
+
+# add in the detection p-values below
+
+
+```
+
+
+> For epigenetic age analyses. Get raw data here:
+
+```{r get geo raw data deposition for epigenetic age analyses}
+
+
+if(file.exists(here("data", "sv_dnam_age_raw_GEO.rds"))) {
+
+raw_eaa_GEO <- readRDS(file = here("data", "sv_dnam_age_raw_GEO.rds"))
+
+} else {
+ 
+ cl <- makeCluster(4)
+ registerDoParallel(cl)
+ clusterExport(cl, c("readIDATpair"))
+
+
+ raw_eaa_GEO <- parLapply(cl,df5$Basename, function(pfx) {
+   readIDATpair(pfx)
+   
+   
+ })
+
+ stopCluster(cl)
+
+ names(raw_eaa_GEO) <- df5$methylation_id
+
+ saveRDS(raw_eaa_GEO, file = here("data","sv_dnam_age_raw_GEO.rds"))
+
+}
+
+```
+
+
+Note that the control probes are not included in the manifest that Illumina submitted to GEO, so if you do include them your submission may get kicked back. Remove control probes before writing to a table to submit to GEO. Store the probes to remove in the "missing probes" object.
+
+```{r check for missing probes geo submission}
+
+my_table <- raw_eaa_GEO[[1]]$Probe_ID
+
+old_table <- read.table(here("output","GPL21145-48548.txt"),
+                        header = TRUE, fill = TRUE)
+
+table(my_table %in% old_table$ID)
+
+missing_probes <- my_table[!(my_table %in% old_table$ID)]
+
+
+```
+
+
+
+> For epigenetic age analyses. Get detection p values here:
+
+```{r get detection pvals for epigenetic age analyses}
+
+if(file.exists(here("data", "sv_dnam_age_raw_pvals_GEO.rds"))) {
+
+pvals <- readRDS(file = here("data", "sv_dnam_age_raw_pvals_GEO.rds"))
+
+} else {
+
+# How to get the detection p-values
+cl <- makeCluster(4)
+ registerDoParallel(cl)
+ clusterExport(cl, c("pOOBAH"))
+
+
+ pvals <- do.call(cbind,parLapply(cl,raw_eaa_GEO[1:164], function(x) {
+   pOOBAH(x, return.pval = TRUE)
+   
+ }))
+
+ stopCluster(cl)
+ 
+ 
+
+ saveRDS(pvals, file = here("data","sv_dnam_age_raw_pvals_GEO.rds"))
+ 
+}
+
+pvals <- as.data.frame(pvals)
+
+pvals$ID_REF <- rownames(pvals)
+
+```
+
+Now combine the processed betas with the detection p-values. Write a .gz compressed .csv file with the required formatting.
+
+```{r combine processed p values with processed beta values eaa}
+
+detection_pvals <- pvals
+
+colnames(detection_pvals)[-ncol(detection_pvals)] <- 
+  paste(colnames(pvals)[-ncol(detection_pvals)], "Detection Pval", sep = " ")
+
+processed <- merge(noobBetasGEO,detection_pvals, by = "ID_REF")
+
+processed <- processed[,order(colnames(processed))]
+
+# Make ID_REF the first column to appear
+processed <- processed %>%
+  relocate(ID_REF) %>% 
+  # Now remove the control probes that 
+  # do not appear in the geo EPIC table
+  filter(!(ID_REF %in% missing_probes))
+
+
+
+
+# fwrite(processed,
+#           file = here("output","geo_sv_dnam_age_processed_matrix_v1.csv.gz"),
+#           row.names = FALSE)
+
+
+```
+
+Now format the raw data and combine with the detection p-values
+
+```{r format raw data and combine with detection p values}
+
+# Select the appropriate signal intensity values for Type I
+# and Type II Infinium probes respectively.
+
+unprocessed <- lapply(raw_eaa_GEO, function(x) {
+  
+  x <- x %>% 
+    mutate(methylated = case_when(
+      col == "2" ~ UG,
+      col == "G" ~ MG,
+      col == "R" ~ MR)) %>% 
+    mutate(unmethylated = case_when(
+      col == "2" ~ UR,
+      col == "G" ~ UG,
+      col == "R" ~ UR)) %>% 
+    select(Probe_ID,methylated,unmethylated) %>% 
+    rename(ID_REF = Probe_ID,
+           "Methylated signal" = methylated,
+           "Unmethylated signal" = unmethylated)
+})
+
+# Change the column names to match formatting requirements
+unprocessed <- imap(unprocessed, ~rename_all(.x, function(z) paste(.y, z, sep = " "))) %>%
+  bind_cols() %>% 
+  rename(ID_REF = 1) %>% 
+  select(-contains(" ID_REF"))
+  
+  
+# Now combine with the detection p-values
+
+unprocessed_detect <- unprocessed %>% 
+  left_join(detection_pvals, by = c("ID_REF"))
+  
+
+
+# Then reorder the columns as prescribed by GEO
+unprocessed_detect <- unprocessed_detect %>% 
+  select(order(colnames(unprocessed_detect),decreasing = TRUE)) %>% 
+  relocate(ID_REF, everything()) %>% 
+  # Now remove the control probes that 
+  # do not appear in the geo EPIC table
+  filter(!(ID_REF %in% missing_probes))
+
+# fwrite(unprocessed_detect,
+#           file = here("output","geo_sv_dnam_age_matrix_signal_v1.csv.gz"),
+#           row.names = FALSE)
+
+
+```
+
+> For Epigenetic age analyses. Get metadata sheet here:
+
+```{r epigenetic age analyses geo metadata sheet}
+
+eaa_geo_metadata <- bdf %>% 
+  mutate(title = paste("genomic DNA from venous blood",
+                       1:nrow(df5),
+                       sep = " "),
+         "source name" = paste("venous blood",
+                               1:nrow(df5),
+                               sep = " "),
+         organism = c("Homo sapiens"),
+         "idat file 1" = paste(str_sub(Basename,-19,-1),
+                               "_Grn.idat",
+                               sep = ""),
+         "idat file 2" = paste(str_sub(Basename,-19,-1),
+                               "_Red.idat",
+                               sep = ""),
+         "characteristics: gender" = if_else(sex == "M","Male","Female"),
+         molecule = c("genomic DNA"),
+         label = c("Cy5 and Cy3"),
+         description = c("Normal venous blood sample"),
+         platform = c("GPL21145"),
+         maternal_age = mom_age)
+
+mage_joiner <- mage %>% 
+  select(methylation_id,DNAmAge,AgeAccelerationResidual)
+
+eaa_geo_metadata <- eaa_geo_metadata %>% 
+  left_join(mage_joiner, by = c("methylation_id"))
+
+
+
+eaa_geo_metadata$Delivery_Mode <- factor(eaa_geo_metadata$pcsec, levels = c(0,1),
+                            labels = c("vaginal","caesarean section"))
+
+eaa_geo_metadata$Alcohol <- factor(eaa_geo_metadata$palco, levels = c(0,1),
+                            labels = c("No","Yes"))
+
+eaa_geo_metadata$Parity <- factor(eaa_geo_metadata$is_this_your_first_child, 
+                                  levels = c(0,1),
+                     labels = c("Multigravida","Primigravida"))
+
+eaa_geo_metadata$Gestational_Age <- eaa_geo_metadata$ga_meth/7
+
+eaa_geo_metadata$War_Stress <- eaa_geo_metadata$swar
+eaa_geo_metadata$Chronic_Stress <- eaa_geo_metadata$schronic
+
+eaa_geo_metadata$Cohort <- factor(eaa_geo_metadata$cohort, levels = c("C","SV"),
+                     labels = c("General Maternity Ward",
+                                "Sexual Violence Ward"))
+
+eaa_geo_metadata$bmi = eaa_geo_metadata$mwgt/((eaa_geo_metadata$mhgt/100)^2)
+
+
+
+eaa_geo_metadata <- eaa_geo_metadata %>% 
+  rename('characteristics: birthweight' = bwgt,
+         'characteristics: maternal bmi' = bmi,
+         'characteristics: age' = Age,
+         'characteristics: dyad' = dyad,
+         'characteristics: maternal age' = maternal_age,
+         'characteristics: delivery mode' = Delivery_Mode,
+         'characteristics: maternal alcohol' = Alcohol,
+         'characteristics: parity' = Parity,
+         'characteristics: gestational age' = Gestational_Age,
+         'characteristics: war trauma' = War_Stress,
+         'characteristics: chronic stress' = Chronic_Stress,
+         'characteristics: cohort' = Cohort,
+         'characteristics: tissue' = tissue,
+         'characteristics: replicate' = replicate,
+         'characteristics: replicate id' = replicate_id,
+         'characteristics: dna methylation age' = DNAmAge,
+         'characteristics: age acceleration' = AgeAccelerationResidual) %>% 
+  select(methylation_id,title,'source name', organism,
+         'idat file 1','idat file 2',
+         'characteristics: gender',
+         'characteristics: tissue',
+         'characteristics: age',
+         'characteristics: birthweight',
+         'characteristics: dyad',
+         'characteristics: maternal age',
+         'characteristics: delivery mode',
+         'characteristics: maternal alcohol',
+         'characteristics: parity',
+         'characteristics: gestational age',
+         'characteristics: war trauma',
+         'characteristics: chronic stress',
+         'characteristics: cohort',
+         'characteristics: replicate',
+         'characteristics: replicate id',
+         'characteristics: dna methylation age',
+         'characteristics: age acceleration',
+         molecule,label,
+         description, platform)
+
+
+
+# fwrite(eaa_geo_metadata,
+#           file = here("output","geo_sv_dnam_age_metadata_v1.csv"),
+#           row.names = FALSE)
+
+```
+
+
+
+Don't forget to write out a codebook explaining column headers in the metadata sheet, which will be the same for both data sets.
+
+```{r make a codebook for geo deposition}
+
+sub_names <- colnames(eaa_geo_metadata)
+
+df <- data.frame(matrix(ncol = 2, nrow = 27))
+df$X1 <- sub_names
+colnames(df) <- c("column header","description")
+
+df$description <- c("unique sample id",
+                    "unique title that describes the sample",
+                    "briefly identify the biological material",
+                    "scientific name of organism from which the biological material was derived",
+                    "the Green .idat file corresponding to the sample",
+                    "the Red .idat file corresponding to the sample",
+                    "the sex of the participant",
+                    "describes whether the tissue is mother or newborn venous blood",
+                    "age of the participant",
+                    "birthweight of the baby",
+                    "the recruitment dyad to which the participant belongs. This is the clustering variable.",
+                    "the age of the mother in the dyad",
+                    "was the delivery vaginal or cesarean section",
+                    "did the mother drink alcohol during pregnancy",
+                    "is the newborn the mother's first child",
+                    "gestational age in weeks estimated using DNA methylation data",
+                    "score based on an ethnographic measure from a prior publication in Child Development by Darlene Kertes et al. 2016",
+                    "score based on an ethnographic measure from a prior publication in Child Development by Darlene Kertes et al. 2016",
+                    "was the participant recruited through the general maternity program or the sexual abuse survivor program",
+                    "is this sample a replicate",
+                    "a unique id assigned to a sample within replicate groups",
+                    "DNA methylation age of the participant",
+                    "age acceleration of the participant",
+                    "type of molecule that was extracted from the biological materials",
+                    "compound used to label the extract",
+                    "basic description of the sample",
+                    "what platform were samples processed on")
+
+# fwrite(df,
+#           file = here("output","geo_column_headers_v1.csv.gz"),
+#           row.names = FALSE)
+
+
+
+```
+
+
+
+
+
+
+
